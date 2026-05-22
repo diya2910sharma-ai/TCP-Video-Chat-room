@@ -1,55 +1,88 @@
 import socket
 import threading
+import json
+import struct
 
 # Configuration
-HOST = '0.0.0.0' # Listen on all available interfaces
-PORT = 5555      # Ensure this port is open in your firewall
+HOST = '0.0.0.0'  # Listen on all available interfaces
+PORT = 5555       # Ensure this port is open in your firewall
 
 clients = []
+clients_lock = threading.Lock()
 
-def handle_client(current_socket, partner_socket):
-    """
-    Receives data from one client and sends it to the other.
-    """
-    try:
-        while True:
-            # Receive data (Video frames or Text)
-            data = current_socket.recv(4096)
-            if not data:
-                break
-            
-            # Relay to the partner
-            partner_socket.sendall(data)
-    except Exception as e:
-        print(f"Connection error: {e}")
-    finally:
-        current_socket.close()
+def relay_data(sender_socket, receiver_socket):
+    """Relay data between two clients with efficient buffering"""
+    buffer = b""
+    payload_size = struct.calcsize("L")
 
-def start_server():
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind((HOST, PORT))
-    server.listen(2)
-    print(f"Server started on {HOST}:{PORT}. Waiting for 2 clients...")
+    while True:
+        try:
+            while len(buffer) < payload_size:
+                chunk = sender_socket.recv(4096)
+                if not chunk:
+                    return
+                buffer += chunk
 
-    # Wait for exactly two clients to connect
-    while len(clients) < 2:
-        conn, addr = server.accept()
-        print(f"Client connected from {addr}")
-        clients.append(conn)
+            msg_size = struct.unpack("L", buffer[:payload_size])[0]
+            buffer = buffer[payload_size:]
 
-    print("Both clients connected. Starting relay...")
-    
-    # Thread 1: Relay Client A -> Client B
-    t1 = threading.Thread(target=handle_client, args=(clients[0], clients[1]))
-    # Thread 2: Relay Client B -> Client A
-    t2 = threading.Thread(target=handle_client, args=(clients[1], clients[0]))
+            while len(buffer) < msg_size:
+                buffer += sender_socket.recv(4096)
+
+            data = buffer[:msg_size]
+            buffer = buffer[msg_size:]
+
+            # Send to receiver without processing (pass-through for efficiency)
+            receiver_socket.sendall(struct.pack("L", len(data)) + data)
+
+        except Exception as e:
+            print(f"Relay error: {e}")
+            break
+
+def handle_client_pair(client1, client2, addr1, addr2):
+    """Handle communication between two clients"""
+    print(f"Pairing {addr1} <-> {addr2}")
+
+    # Start bidirectional relay threads
+    t1 = threading.Thread(target=relay_data, args=(client1, client2), daemon=True)
+    t2 = threading.Thread(target=relay_data, args=(client2, client1), daemon=True)
 
     t1.start()
     t2.start()
-    
+
     t1.join()
     t2.join()
-    print("Session ended.")
+
+    print(f"Session ended for {addr1} <-> {addr2}")
+
+def start_server():
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((HOST, PORT))
+    server.listen(5)
+    print(f"Server started on {HOST}:{PORT}. Waiting for clients...")
+
+    try:
+        while True:
+            # Wait for first client
+            conn1, addr1 = server.accept()
+            print(f"Client 1 connected from {addr1}")
+
+            # Wait for second client
+            conn2, addr2 = server.accept()
+            print(f"Client 2 connected from {addr2}")
+
+            # Handle this pair in a new thread
+            threading.Thread(
+                target=handle_client_pair,
+                args=(conn1, conn2, addr1, addr2),
+                daemon=True
+            ).start()
+
+    except KeyboardInterrupt:
+        print("Server shutting down...")
+    finally:
+        server.close()
 
 if __name__ == "__main__":
     start_server()
